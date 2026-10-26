@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0d0f1c" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Block Blast" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<title>Block Blast</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0d0f1c;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  #game {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var SIZE = 8;
+  var EMPTY = -1;
+  var PALETTE = ['#fa5c6b', '#fd9e3d', '#fdd64a', '#6bd573', '#4dc4ed', '#6b87fa', '#b878fa', '#fa78bf'];
+  var FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 3);
+
+  // ---- layout ----
+  var W = 0, H = 0, cell = 0, boardSide = 0, boardX = 0, boardY = 0;
+  var trayY = 0, trayCell = 0, traySlotW = 0, trayH = 0, safeTopPx = 0;
+
+  // safe-area probe
+  var probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed;top:0;left:0;padding-top:env(safe-area-inset-top);visibility:hidden;';
+  document.body.appendChild(probe);
+  function readSafeTop() {
+    var v = parseFloat(getComputedStyle(probe).paddingTop);
+    return isNaN(v) ? 0 : v;
+  }
+
+  // ---- shape catalog (base shapes rotated into every orientation) ----
+  function normalize(cells) {
+    var minR = Infinity, minC = Infinity, i;
+    for (i = 0; i < cells.length; i++) {
+      if (cells[i].r < minR) minR = cells[i].r;
+      if (cells[i].c < minC) minC = cells[i].c;
+    }
+    var out = [];
+    for (i = 0; i < cells.length; i++) out.push({ r: cells[i].r - minR, c: cells[i].c - minC });
+    out.sort(function (a, b) { return a.r - b.r || a.c - b.c; });
+    return out;
+  }
+  function rotate(cells) {
+    var maxR = 0, i;
+    for (i = 0; i < cells.length; i++) if (cells[i].r > maxR) maxR = cells[i].r;
+    var out = [];
+    for (i = 0; i < cells.length; i++) out.push({ r: cells[i].c, c: maxR - cells[i].r });
+    return normalize(out);
+  }
+  function shapeKey(cells) {
+    var parts = [];
+    for (var i = 0; i < cells.length; i++) parts.push(cells[i].r + ':' + cells[i].c);
+    return parts.join(',');
+  }
+  function toCells(a) {
+    var out = [];
+    for (var i = 0; i < a.length; i++) out.push({ r: a[i][0], c: a[i][1] });
+    return out;
+  }
+  var BASE = [
+    [[0, 0]],
+    [[0, 0], [0, 1]],
+    [[0, 0], [0, 1], [0, 2]],
+    [[0, 0], [0, 1], [0, 2], [0, 3]],
+    [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4]],
+    [[0, 0], [0, 1], [1, 0], [1, 1]],
+    [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]],
+    [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2], [2, 0], [2, 1], [2, 2]],
+    [[0, 0], [0, 1], [1, 0]],
+    [[0, 0], [1, 0], [2, 0], [2, 1]],
+    [[0, 0], [0, 1], [0, 2], [1, 1]],
+    [[0, 1], [0, 2], [1, 0], [1, 1]],
+    [[0, 0], [0, 1], [1, 1], [1, 2]],
+    [[0, 0], [0, 1], [0, 2], [1, 0], [2, 0]]
+  ];
+  var SHAPE_META = (function () {
+    var seen = {}, out = [];
+    for (var b = 0; b < BASE.length; b++) {
+      var cur = normalize(toCells(BASE[b]));
+      for (var k = 0; k < 4; k++) {
+        var n = normalize(cur);
+        var key = shapeKey(n);
+        if (!seen[key]) {
+          seen[key] = true;
+          var w = 0, h = 0;
+          for (var i = 0; i < n.length; i++) {
+            if (n[i].c + 1 > w) w = n[i].c + 1;
+            if (n[i].r + 1 > h) h = n[i].r + 1;
+          }
+          out.push({ cells: n, w: w, h: h, size: n.length });
+        }
+        cur = rotate(n);
+      }
+    }
+    return out;
+  })();
+
+  // ---- state ----
+  var board = new Int16Array(SIZE * SIZE);
+  var tray = [null, null, null];
+  var score = 0, best = 0, combo = 0;
+  var dragging = null;
+  var ghost = null;
+  var clearing = null;
+  var gameOver = false;
+  var restartBtn = null;
+  var now = 0;
+
+  try { best = parseInt(localStorage.getItem('blockblast.best') || '0', 10) || 0; } catch (e) { best = 0; }
+
+  // ---- board helpers ----
+  function getAt(r, c) { return board[r * SIZE + c]; }
+  function setAt(r, c, v) { board[r * SIZE + c] = v; }
+
+  function fits(piece, or, oc) {
+    for (var i = 0; i < piece.cells.length; i++) {
+      var r = or + piece.cells[i].r, c = oc + piece.cells[i].c;
+      if (r < 0 || c < 0 || r >= SIZE || c >= SIZE) return false;
+      if (board[r * SIZE + c] !== EMPTY) return false;
+    }
+    return true;
+  }
+  function positions(piece) {
+    var out = [];
+    if (piece.w > SIZE || piece.h > SIZE) return out;
+    for (var r = 0; r <= SIZE - piece.h; r++) {
+      for (var c = 0; c <= SIZE - piece.w; c++) {
+        if (fits(piece, r, c)) out.push([r, c]);
+      }
+    }
+    return out;
+  }
+
+  // Can all three pieces (any order, any spots) be placed on the current board?
+  // Line clears are ignored on purpose: that makes the guarantee conservative.
+  function canPlaceAll(pieces) {
+    var scratch = Int16Array.from(board);
+    function fitsS(piece, or, oc) {
+      for (var i = 0; i < piece.cells.length; i++) {
+        var r = or + piece.cells[i].r, c = oc + piece.cells[i].c;
+        if (r < 0 || c < 0 || r >= SIZE || c >= SIZE) return false;
+        if (scratch[r * SIZE + c] !== EMPTY) return false;
+      }
+      return true;
+    }
+    function posS(piece) {
+      var out = [];
+      if (piece.w > SIZE || piece.h > SIZE) return out;
+      for (var r = 0; r <= SIZE - piece.h; r++) {
+        for (var c = 0; c <= SIZE - piece.w; c++) if (fitsS(piece, r, c)) out.push([r, c]);
+      }
+      return out;
+    }
+    var ordered = pieces.slice().sort(function (a, b) { return posS(a).length - posS(b).length; });
+    function dfs(i) {
+      if (i === ordered.length) return true;
+      var p = ordered[i];
+      var ps = posS(p);
+      for (var k = 0; k < ps.length; k++) {
+        var or = ps[k][0], oc = ps[k][1];
+        var undo = [];
+        for (var j = 0; j < p.cells.length; j++) {
+          var ix = (or + p.cells[j].r) * SIZE + (oc + p.cells[j].c);
+          scratch[ix] = p.color;
+          undo.push(ix);
+        }
+        var ok = dfs(i + 1);
+        for (var u = 0; u < undo.length; u++) scratch[undo[u]] = EMPTY;
+        if (ok) return true;
+      }
+      return false;
+    }
+    return dfs(0);
+  }
+
+  function makePiece(meta) {
+    return {
+      cells: meta.cells,
+      w: meta.w,
+      h: meta.h,
+      size: meta.size,
+      color: Math.floor(Math.random() * PALETTE.length)
+    };
+  }
+
+  // ---- "best shape" generation ----
+  // Each shape is scored on its single best legal placement on the current
+  // board: clearing lines is heavily rewarded, and the board left behind is
+  // penalised for enclosed holes, isolated empty cells and column roughness.
+  // The tray is filled from the top-scoring shapes (weighted, so it is not
+  // purely deterministic), always preferring a trio that can all be placed.
+
+  var CLEAR_BONUS = 120;
+
+  function boardQuality(b) {
+    var n = SIZE * SIZE;
+    var visited = new Uint8Array(n);
+    var components = 0, isolated = 0;
+    var dr = [1, -1, 0, 0], dc = [0, 0, 1, -1];
+    for (var i = 0; i < n; i++) {
+      if (b[i] !== EMPTY) continue;
+      var r = (i / SIZE) | 0, c = i % SIZE;
+      var nb = 0;
+      for (var k = 0; k < 4; k++) {
+        var nr = r + dr[k], nc = c + dc[k];
+        if (nr >= 0 && nc >= 0 && nr < SIZE && nc < SIZE && b[nr * SIZE + nc] === EMPTY) nb++;
+      }
+      if (nb === 0) isolated++;
+      if (!visited[i]) {
+        components++;
+        var stack = [i];
+        visited[i] = 1;
+        while (stack.length) {
+          var cur = stack.pop();
+          var cr = (cur / SIZE) | 0, cc = cur % SIZE;
+          for (var d = 0; d < 4; d++) {
+            var rr = cr + dr[d], ccc = cc + dc[d];
+            if (rr >= 0 && ccc >= 0 && rr < SIZE && ccc < SIZE) {
+              var ni = rr * SIZE + ccc;
+              if (b[ni] === EMPTY && !visited[ni]) { visited[ni] = 1; stack.push(ni); }
+            }
+          }
+        }
+      }
+    }
+    var colFill = [0, 0, 0, 0, 0, 0, 0, 0], r2, c2;
+    for (r2 = 0; r2 < SIZE; r2++) for (c2 = 0; c2 < SIZE; c2++) if (b[r2 * SIZE + c2] !== EMPTY) colFill[c2]++;
+    var rough = 0;
+    for (c2 = 0; c2 + 1 < SIZE; c2++) rough += Math.abs(colFill[c2] - colFill[c2 + 1]);
+    return -3 * isolated - 2 * Math.max(0, components - 1) - 0.5 * rough;
+  }
+
+  function shapeBestValue(meta) {
+    if (meta.w > SIZE || meta.h > SIZE) return { value: -Infinity, count: 0 };
+    var best = -Infinity, count = 0;
+    for (var or = 0; or <= SIZE - meta.h; or++) {
+      for (var oc = 0; oc <= SIZE - meta.w; oc++) {
+        if (!fits(meta, or, oc)) continue;
+        count++;
+        var scratch = Int16Array.from(board);
+        for (var i = 0; i < meta.cells.length; i++) {
+          scratch[(or + meta.cells[i].r) * SIZE + (oc + meta.cells[i].c)] = 0;
+        }
+        var rows = [], cols = [], r, c, full;
+        for (r = 0; r < SIZE; r++) {
+          full = true;
+          for (c = 0; c < SIZE; c++) if (scratch[r * SIZE + c] === EMPTY) { full = false; break; }
+          if (full) rows.push(r);
+        }
+        for (c = 0; c < SIZE; c++) {
+          full = true;
+          for (r = 0; r < SIZE; r++) if (scratch[r * SIZE + c] === EMPTY) { full = false; break; }
+          if (full) cols.push(c);
+        }
+        for (var ri = 0; ri < rows.length; ri++) for (c = 0; c < SIZE; c++) scratch[rows[ri] * SIZE + c] = EMPTY;
+        for (var ci = 0; ci < cols.length; ci++) for (r = 0; r < SIZE; r++) scratch[r * SIZE + cols[ci]] = EMPTY;
+        var value = (rows.length + cols.length) * CLEAR_BONUS + boardQuality(scratch);
+        if (value > best) best = value;
+      }
+    }
+    return { value: best, count: count };
+  }
+
+  function generatePieces() {
+    var candidates = [], i;
+    for (i = 0; i < SHAPE_META.length; i++) {
+      var res = shapeBestValue(SHAPE_META[i]);
+      if (res.count > 0) {
+        candidates.push({ meta: SHAPE_META[i], value: res.value + 0.5 * res.count });
+      }
+    }
+    if (candidates.length === 0) return [];
+    candidates.sort(function (a, b) { return b.value - a.value; });
+
+    var maxValue = candidates[0].value;
+    var TEMP = 30;
+    function weight(c) { return Math.exp((c.value - maxValue) / TEMP); }
+
+    function pickMeta(exclude) {
+      var total = 0, k;
+      for (k = 0; k < candidates.length; k++) {
+        if (exclude.indexOf(candidates[k].meta) >= 0) continue;
+        total += weight(candidates[k]);
+      }
+      if (total <= 0) return candidates[0].meta;
+      var r = Math.random() * total;
+      for (k = 0; k < candidates.length; k++) {
+        if (exclude.indexOf(candidates[k].meta) >= 0) continue;
+        r -= weight(candidates[k]);
+        if (r <= 0) return candidates[k].meta;
+      }
+      return candidates[candidates.length - 1].meta;
+    }
+
+    for (var t = 0; t < 40; t++) {
+      var m1 = pickMeta([]);
+      var m2 = pickMeta([m1]);
+      var m3 = pickMeta([m1, m2]);
+      var trio = [makePiece(m1), makePiece(m2), makePiece(m3)];
+      if (canPlaceAll(trio)) return trio;
+    }
+    return [makePiece(pickMeta([])), makePiece(pickMeta([])), makePiece(pickMeta([]))];
+  }
+
+  function refillTray() {
+    var pieces = generatePieces();
+    tray = [null, null, null];
+    if (pieces.length === 0) { gameOver = true; return; }
+    for (var i = 0; i < pieces.length && i < 3; i++) tray[i] = pieces[i];
+  }
+
+  function anyCanPlace() {
+    for (var i = 0; i < tray.length; i++) if (tray[i] && positions(tray[i]).length > 0) return true;
+    return false;
+  }
+
+  function saveBest() {
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('blockblast.best', String(best)); } catch (e) {}
+    }
+  }
+
+  function finalizeTurn() {
+    var allEmpty = true;
+    for (var i = 0; i < tray.length; i++) if (tray[i] !== null) { allEmpty = false; break; }
+    if (allEmpty) refillTray();
+    if (!anyCanPlace()) gameOver = true;
+    saveBest();
+  }
+
+  function place(piece, trayIndex, or, oc) {
+    for (var i = 0; i < piece.cells.length; i++) {
+      setAt(or + piece.cells[i].r, oc + piece.cells[i].c, piece.color);
+    }
+    tray[trayIndex] = null;
+    score += piece.size;
+
+    var rows = [], cols = [], r, c, full;
+    for (r = 0; r < SIZE; r++) {
+      full = true;
+      for (c = 0; c < SIZE; c++) if (getAt(r, c) === EMPTY) { full = false; break; }
+      if (full) rows.push(r);
+    }
+    for (c = 0; c < SIZE; c++) {
+      full = true;
+      for (r = 0; r < SIZE; r++) if (getAt(r, c) === EMPTY) { full = false; break; }
+      if (full) cols.push(c);
+    }
+
+    if (rows.length === 0 && cols.length === 0) {
+      combo = 0;
+      finalizeTurn();
+      return;
+    }
+
+    combo += 1;
+    score += (rows.length + cols.length) * 10 * Math.max(1, combo);
+
+    var cells = [];
+    for (var ri = 0; ri < rows.length; ri++) for (c = 0; c < SIZE; c++) cells.push(rows[ri] * SIZE + c);
+    for (var ci = 0; ci < cols.length; ci++) for (r = 0; r < SIZE; r++) cells.push(r * SIZE + cols[ci]);
+    clearing = { cells: cells, removeAt: performance.now() + 170 };
+  }
+
+  function newGame() {
+    board.fill(EMPTY);
+    tray = [null, null, null];
+    score = 0; combo = 0; gameOver = false;
+    clearing = null; dragging = null; ghost = null;
+    refillTray();
+    saveBest();
+  }
+
+  // ---- layout ----
+  function layout() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    safeTopPx = readSafeTop();
+
+    var topPad = safeTopPx + 72;
+    var side = Math.max(150, Math.min(W - 28, H * 0.56));
+    cell = Math.floor(side / SIZE);
+    boardSide = cell * SIZE;
+    boardX = Math.round((W - boardSide) / 2);
+    boardY = Math.round(topPad);
+
+    trayCell = cell * 0.58;
+    traySlotW = boardSide / 3;
+    trayH = Math.max(70, boardSide * 0.28);
+    trayY = boardY + boardSide + Math.round(H * 0.028);
+
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // ---- drawing ----
+  function roundRect(x, y, w, h, r) {
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function shade(hex, f) {
+    var n = parseInt(hex.slice(1), 16);
+    var r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    r = Math.max(0, Math.min(255, Math.round(r * f)));
+    g = Math.max(0, Math.min(255, Math.round(g * f)));
+    b = Math.max(0, Math.min(255, Math.round(b * f)));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+  function drawBlock(x, y, size, color, alpha) {
+    if (alpha === undefined) alpha = 1;
+    var pad = size * 0.05, r = size * 0.18;
+    var bx = x + pad, by = y + pad, bw = size - pad * 2, bh = size - pad * 2;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    var g = ctx.createLinearGradient(0, by, 0, by + bh);
+    g.addColorStop(0, shade(color, 1.18));
+    g.addColorStop(1, shade(color, 0.82));
+    ctx.fillStyle = g;
+    roundRect(bx, by, bw, bh, r);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+    ctx.lineWidth = Math.max(1, size * 0.02);
+    roundRect(bx, by, bw, bh, r);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawSlot(x, y, size) {
+    var pad = size * 0.05, r = size * 0.18;
+    ctx.fillStyle = '#272c46';
+    roundRect(x + pad, y + pad, size - pad * 2, size - pad * 2, r);
+    ctx.fill();
+  }
+  function drawCellInvalid(x, y, size) {
+    var pad = size * 0.05, r = size * 0.18;
+    ctx.save();
+    ctx.fillStyle = 'rgba(250,92,107,0.30)';
+    roundRect(x + pad, y + pad, size - pad * 2, size - pad * 2, r);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(250,92,107,0.9)';
+    ctx.lineWidth = Math.max(1.5, size * 0.03);
+    roundRect(x + pad, y + pad, size - pad * 2, size - pad * 2, r);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawPieceTopLeft(x, y, piece, size, alpha) {
+    for (var i = 0; i < piece.cells.length; i++) {
+      drawBlock(x + piece.cells[i].c * size, y + piece.cells[i].r * size, size, PALETTE[piece.color], alpha);
+    }
+  }
+
+  function completedByGhost() {
+    if (!ghost || !ghost.valid) return [];
+    var occupied = Int16Array.from(board);
+    for (var i = 0; i < ghost.piece.cells.length; i++) {
+      var r = ghost.origin[0] + ghost.piece.cells[i].r;
+      var c = ghost.origin[1] + ghost.piece.cells[i].c;
+      if (r >= 0 && c >= 0 && r < SIZE && c < SIZE) occupied[r * SIZE + c] = ghost.piece.color;
+    }
+    var out = [];
+    for (r = 0; r < SIZE; r++) {
+      var full = true;
+      for (c = 0; c < SIZE; c++) if (occupied[r * SIZE + c] === EMPTY) { full = false; break; }
+      if (full) for (c = 0; c < SIZE; c++) out.push(r * SIZE + c);
+    }
+    for (c = 0; c < SIZE; c++) {
+      var fullc = true;
+      for (r = 0; r < SIZE; r++) if (occupied[r * SIZE + c] === EMPTY) { fullc = false; break; }
+      if (fullc) for (r = 0; r < SIZE; r++) out.push(r * SIZE + c);
+    }
+    return out;
+  }
+
+  function draw() {
+    // background
+    ctx.fillStyle = '#0d0f1c';
+    ctx.fillRect(0, 0, W, H);
+
+    // ---- HUD ----
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    var hudTop = safeTopPx + 12;
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '600 11px ' + FONT;
+    ctx.fillText('SCORE', boardX + 4, hudTop + 12);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 26px ' + FONT;
+    ctx.fillText(String(score), boardX + 4, hudTop + 42);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '600 11px ' + FONT;
+    ctx.fillText('BEST', boardX + boardSide - 4, hudTop + 12);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 26px ' + FONT;
+    ctx.fillText(String(best), boardX + boardSide - 4, hudTop + 42);
+
+    if (combo > 1) {
+      var label = 'COMBO x' + combo;
+      ctx.font = '800 14px ' + FONT;
+      var tw = ctx.measureText(label).width;
+      var cw = tw + 26, chh = 28;
+      var cx = W / 2 - cw / 2, cy = hudTop + 8;
+      ctx.fillStyle = '#fdd64a';
+      roundRect(cx, cy, cw, chh, chh / 2);
+      ctx.fill();
+      ctx.fillStyle = '#0d0f1c';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, W / 2, cy + chh / 2 + 1);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
+
+    // ---- board ----
+    ctx.fillStyle = '#1b2036';
+    roundRect(boardX, boardY, boardSide, boardSide, cell * 0.24);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    roundRect(boardX, boardY, boardSide, boardSide, cell * 0.24);
+    ctx.stroke();
+
+    var r, c, v;
+    for (r = 0; r < SIZE; r++) {
+      for (c = 0; c < SIZE; c++) {
+        var x = boardX + c * cell, y = boardY + r * cell;
+        drawSlot(x, y, cell);
+      }
+    }
+    for (r = 0; r < SIZE; r++) {
+      for (c = 0; c < SIZE; c++) {
+        v = getAt(r, c);
+        if (v !== EMPTY) drawBlock(boardX + c * cell, boardY + r * cell, cell, PALETTE[v]);
+      }
+    }
+
+    // ghost completion highlight
+    var hl = completedByGhost();
+    ctx.fillStyle = 'rgba(255,255,255,0.14)';
+    for (var h = 0; h < hl.length; h++) {
+      var hr = Math.floor(hl[h] / SIZE), hc = hl[h] % SIZE;
+      ctx.fillRect(boardX + hc * cell + cell * 0.05, boardY + hr * cell + cell * 0.05, cell * 0.9, cell * 0.9);
+    }
+
+    // clearing flash
+    if (clearing) {
+      for (var q = 0; q < clearing.cells.length; q++) {
+        var cr = Math.floor(clearing.cells[q] / SIZE), cc = clearing.cells[q] % SIZE;
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        roundRect(boardX + cc * cell + cell * 0.09, boardY + cr * cell + cell * 0.09, cell * 0.82, cell * 0.82, cell * 0.18);
+        ctx.fill();
+      }
+    }
+
+    // ghost piece
+    if (ghost) {
+      for (var gi = 0; gi < ghost.piece.cells.length; gi++) {
+        var gr = ghost.origin[0] + ghost.piece.cells[gi].r;
+        var gc = ghost.origin[1] + ghost.piece.cells[gi].c;
+        if (gr < 0 || gc < 0 || gr >= SIZE || gc >= SIZE) continue;
+        var gx = boardX + gc * cell, gy = boardY + gr * cell;
+        if (ghost.valid) {
+          drawBlock(gx, gy, cell, PALETTE[ghost.piece.color], 0.55);
+          ctx.save();
+          ctx.strokeStyle = PALETTE[ghost.piece.color];
+          ctx.lineWidth = 1.5;
+          roundRect(gx + cell * 0.05, gy + cell * 0.05, cell * 0.9, cell * 0.9, cell * 0.18);
+          ctx.stroke();
+          ctx.restore();
+        } else {
+          drawCellInvalid(gx, gy, cell);
+        }
+      }
+    }
+
+    // ---- tray ----
+    for (var i = 0; i < 3; i++) {
+      var sx = boardX + i * traySlotW, sy = trayY;
+      ctx.fillStyle = 'rgba(255,255,255,0.04)';
+      roundRect(sx + 5, sy, traySlotW - 10, trayH, 16);
+      ctx.fill();
+
+      var piece = tray[i];
+      if (piece && (!dragging || dragging.index !== i)) {
+        var pw = piece.w * trayCell, ph = piece.h * trayCell;
+        var px = sx + (traySlotW - pw) / 2;
+        var py = sy + (trayH - ph) / 2;
+        drawPieceTopLeft(px, py, piece, trayCell, 1);
+      }
+    }
+
+    // ---- dragging piece ----
+    if (dragging) {
+      var lift = cell * 1.15;
+      var dcx = dragging.x, dcy = dragging.y - lift;
+      var dpw = dragging.piece.w * cell, dph = dragging.piece.h * cell;
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,0.35)';
+      ctx.shadowBlur = 12;
+      ctx.shadowOffsetY = 8;
+      drawPieceTopLeft(dcx - dpw / 2, dcy - dph / 2, dragging.piece, cell, 1);
+      ctx.restore();
+    }
+
+    // ---- game over ----
+    if (gameOver) drawGameOver();
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    var pw = Math.min(W - 56, 320), ph = 286;
+    var px = (W - pw) / 2, py = (H - ph) / 2;
+    ctx.fillStyle = '#1b2036';
+    roundRect(px, py, pw, ph, 26);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    roundRect(px, py, pw, ph, 26);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 30px ' + FONT;
+    ctx.fillText('GAME OVER', W / 2, py + 56);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '600 13px ' + FONT;
+    ctx.fillText('SCORE', W / 2, py + 94);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 40px ' + FONT;
+    ctx.fillText(String(score), W / 2, py + 138);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '600 15px ' + FONT;
+    ctx.fillText('Best ' + best, W / 2, py + 168);
+
+    var bw = 200, bh = 52, bx = (W - bw) / 2, by = py + ph - 80;
+    restartBtn = { x: bx, y: by, w: bw, h: bh };
+    ctx.fillStyle = '#fdd64a';
+    roundRect(bx, by, bw, bh, bh / 2);
+    ctx.fill();
+    ctx.fillStyle = '#0d0f1c';
+    ctx.font = '800 17px ' + FONT;
+    ctx.textBaseline = 'middle';
+    ctx.fillText('PLAY AGAIN', W / 2, by + bh / 2 + 1);
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+  }
+
+  // ---- input ----
+  function localPoint(e) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  function inRect(p, x, y, w, h) {
+    return p.x >= x && p.x <= x + w && p.y >= y && p.y <= y + h;
+  }
+
+  function updateGhost() {
+    if (!dragging) { ghost = null; return; }
+    var same = ghost && ghost.piece === dragging.piece;
+    var lift = cell * 1.15;
+    var cx = dragging.x, cy = dragging.y - lift;
+    var pw = dragging.piece.w * cell, ph = dragging.piece.h * cell;
+    var tlX = cx - pw / 2, tlY = cy - ph / 2;
+    var intersects = tlX < boardX + boardSide && tlX + pw > boardX && tlY < boardY + boardSide && tlY + ph > boardY;
+    if (!intersects) { ghost = null; return; }
+    var oc = Math.round((tlX - boardX) / cell);
+    var or = Math.round((tlY - boardY) / cell);
+    ghost = { origin: [or, oc], piece: dragging.piece, valid: fits(dragging.piece, or, oc) };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    if (gameOver || clearing) return;
+    var p = localPoint(e);
+    for (var i = 0; i < 3; i++) {
+      var sx = boardX + i * traySlotW;
+      if (tray[i] && inRect(p, sx, trayY, traySlotW, trayH)) {
+        dragging = { index: i, piece: tray[i], x: p.x, y: p.y };
+        ghost = null;
+        updateGhost();
+        if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+        e.preventDefault();
+        return;
+      }
+    }
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = localPoint(e);
+    dragging.x = p.x;
+    dragging.y = p.y;
+    updateGhost();
+    e.preventDefault();
+  });
+
+  function endDrag(commit) {
+    if (!dragging) return;
+    var d = dragging;
+    var g = ghost;
+    dragging = null;
+    ghost = null;
+    if (commit && g && g.valid) {
+      place(d.piece, d.index, g.origin[0], g.origin[1]);
+    }
+  }
+
+  canvas.addEventListener('pointerup', function (e) {
+    if (gameOver) {
+      var p = localPoint(e);
+      if (restartBtn && inRect(p, restartBtn.x, restartBtn.y, restartBtn.w, restartBtn.h)) newGame();
+      return;
+    }
+    endDrag(true);
+  });
+  canvas.addEventListener('pointercancel', function () { endDrag(false); });
+
+  document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+  document.addEventListener('dblclick', function (e) { e.preventDefault(); }, { passive: false });
+
+  window.addEventListener('resize', layout);
+  window.addEventListener('orientationchange', function () { setTimeout(layout, 250); });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', layout);
+
+  // ---- loop ----
+  function frame() {
+    now = performance.now();
+    if (clearing && now >= clearing.removeAt) {
+      for (var i = 0; i < clearing.cells.length; i++) board[clearing.cells[i]] = EMPTY;
+      clearing = null;
+      finalizeTurn();
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  layout();
+  newGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
