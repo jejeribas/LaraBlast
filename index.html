@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
@@ -140,6 +140,9 @@
   var gameOver = false;
   var restartBtn = null;
   var now = 0;
+  var particles = [];
+  var perfectFx = null;   // { start } while the perfect-clear celebration plays
+  var lastFrame = 0;
 
   try { best = parseInt(localStorage.getItem('blockblast.best') || '0', 10) || 0; } catch (e) { best = 0; }
 
@@ -296,7 +299,145 @@
     return { value: best, count: count };
   }
 
+  // ---- "perfect clear" helper ----
+  // When the board is nearly empty, look for three pieces that, placed in the
+  // right spots, wipe the whole board. The idea: pick a small set of rows/columns
+  // that covers every filled cell, then tile the missing cells of those lines
+  // with exactly three catalog shapes. Fewer lines are preferred (more natural
+  // pieces), and solutions that work in ANY placement order are preferred.
+
+  var PERFECT_MAX_FILLED = 16;   // "near empty" threshold (filled cells)
+  var HELP_COOLDOWN = 3;         // trays without help after a helping tray
+  var helpWait = 0;              // trays left before help is allowed again
+
+  function simulateOrder(placements, order) {
+    var s = Int16Array.from(board), i, j, r, c, full;
+    for (i = 0; i < order.length; i++) {
+      var pl = placements[order[i]];
+      for (j = 0; j < pl.meta.cells.length; j++) {
+        s[(pl.r + pl.meta.cells[j].r) * SIZE + (pl.c + pl.meta.cells[j].c)] = 0;
+      }
+      var rows = [], cols = [];
+      for (r = 0; r < SIZE; r++) {
+        full = true;
+        for (c = 0; c < SIZE; c++) if (s[r * SIZE + c] === EMPTY) { full = false; break; }
+        if (full) rows.push(r);
+      }
+      for (c = 0; c < SIZE; c++) {
+        full = true;
+        for (r = 0; r < SIZE; r++) if (s[r * SIZE + c] === EMPTY) { full = false; break; }
+        if (full) cols.push(c);
+      }
+      for (j = 0; j < rows.length; j++) for (c = 0; c < SIZE; c++) s[rows[j] * SIZE + c] = EMPTY;
+      for (j = 0; j < cols.length; j++) for (r = 0; r < SIZE; r++) s[r * SIZE + cols[j]] = EMPTY;
+    }
+    for (i = 0; i < s.length; i++) if (s[i] !== EMPTY) return false;
+    return true;
+  }
+
+  var PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+
+  function findPerfectClear() {
+    var n = SIZE * SIZE, filled = 0, i, k;
+    for (i = 0; i < n; i++) if (board[i] !== EMPTY) filled++;
+    if (filled < 1 || filled > PERFECT_MAX_FILLED) return null;
+
+    // cell sets for each line: 0..7 rows, 8..15 columns
+    var lineCells = [];
+    for (i = 0; i < SIZE; i++) {
+      var rowC = [], colC = [];
+      for (k = 0; k < SIZE; k++) { rowC.push(i * SIZE + k); colC.push(k * SIZE + i); }
+      lineCells.push(rowC);
+    }
+    for (i = 0; i < SIZE; i++) {
+      var cc = [];
+      for (k = 0; k < SIZE; k++) cc.push(k * SIZE + i);
+      lineCells.push(cc);
+    }
+
+    var solutionsBySize = { 1: [], 2: [], 3: [], 4: [] };
+
+    function consider(lines) {
+      var inCover = new Uint8Array(n), a, b;
+      for (a = 0; a < lines.length; a++) {
+        for (b = 0; b < SIZE; b++) inCover[lineCells[lines[a]][b]] = 1;
+      }
+      // every filled cell must lie inside the chosen lines
+      for (a = 0; a < n; a++) if (board[a] !== EMPTY && !inCover[a]) return;
+      // cells the three pieces must fill exactly
+      var missing = new Uint8Array(n), count = 0;
+      for (a = 0; a < n; a++) if (inCover[a] && board[a] === EMPTY) { missing[a] = 1; count++; }
+      if (count < 3 || count > 27) return;
+      if (lines.length === 4 && solutionsBySize[1].length + solutionsBySize[2].length + solutionsBySize[3].length > 0) return;
+
+      var found = [];
+      (function tile(left, depth, chosen) {
+        if (found.length >= 60) return;
+        var first = -1, a2;
+        for (a2 = 0; a2 < n; a2++) if (missing[a2]) { first = a2; break; }
+        if (depth === 3) { if (first === -1) found.push(chosen.slice()); return; }
+        if (first === -1) return;
+        if (left < (3 - depth) || left > 9 * (3 - depth)) return;
+        var fr = (first / SIZE) | 0, fc = first % SIZE;
+        for (var m = 0; m < SHAPE_META.length; m++) {
+          var meta = SHAPE_META[m];
+          var or = fr - meta.cells[0].r, oc = fc - meta.cells[0].c;
+          if (or < 0 || oc < 0 || or + meta.h > SIZE || oc + meta.w > SIZE) continue;
+          var ok = true, j;
+          for (j = 0; j < meta.cells.length; j++) {
+            if (!missing[(or + meta.cells[j].r) * SIZE + (oc + meta.cells[j].c)]) { ok = false; break; }
+          }
+          if (!ok) continue;
+          for (j = 0; j < meta.cells.length; j++) missing[(or + meta.cells[j].r) * SIZE + (oc + meta.cells[j].c)] = 0;
+          chosen.push({ meta: meta, r: or, c: oc });
+          tile(left - meta.size, depth + 1, chosen);
+          chosen.pop();
+          for (j = 0; j < meta.cells.length; j++) missing[(or + meta.cells[j].r) * SIZE + (oc + meta.cells[j].c)] = 1;
+        }
+      })(count, 0, []);
+
+      for (a = 0; a < found.length; a++) solutionsBySize[lines.length].push(found[a]);
+    }
+
+    var a1, a2, a3;
+    for (a1 = 0; a1 < 16; a1++) consider([a1]);
+    for (a1 = 0; a1 < 16; a1++) for (a2 = a1 + 1; a2 < 16; a2++) consider([a1, a2]);
+    for (a1 = 0; a1 < 16; a1++) for (a2 = a1 + 1; a2 < 16; a2++) for (a3 = a2 + 1; a3 < 16; a3++) consider([a1, a2, a3]);
+    var a4;
+    for (a1 = 0; a1 < 16; a1++) for (a2 = a1 + 1; a2 < 16; a2++) for (a3 = a2 + 1; a3 < 16; a3++) for (a4 = a3 + 1; a4 < 16; a4++) consider([a1, a2, a3, a4]);
+
+    // prefer the fewest lines; among those, solutions that work in every order
+    var bestAny = null, bestAnyScore = 0;
+    for (var size = 1; size <= 4; size++) {
+      var list = solutionsBySize[size], good = [];
+      for (i = 0; i < list.length; i++) {
+        var score = 0;
+        for (k = 0; k < PERMS.length; k++) if (simulateOrder(list[i], PERMS[k])) score++;
+        if (score === PERMS.length) good.push(list[i]);
+        else if (score > bestAnyScore) { bestAnyScore = score; bestAny = list[i]; }
+      }
+      if (good.length) return finishPerfect(good[Math.floor(Math.random() * good.length)]);
+    }
+    return bestAny ? finishPerfect(bestAny) : null;
+  }
+
+  function finishPerfect(sol) {
+    var pieces = [], i;
+    for (i = 0; i < sol.length; i++) pieces.push(makePiece(sol[i].meta));
+    for (i = pieces.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = pieces[i]; pieces[i] = pieces[j]; pieces[j] = t;
+    }
+    return pieces;
+  }
+
   function generatePieces() {
+    if (helpWait > 0) {
+      helpWait--;
+    } else {
+      var perfect = findPerfectClear();
+      if (perfect) { helpWait = HELP_COOLDOWN; return perfect; }
+    }
     var candidates = [], i;
     for (i = 0; i < SHAPE_META.length; i++) {
       var res = shapeBestValue(SHAPE_META[i]);
@@ -402,6 +543,8 @@
     board.fill(EMPTY);
     tray = [null, null, null];
     score = 0; combo = 0; gameOver = false;
+    helpWait = 0;
+    particles = []; perfectFx = null;
     clearing = null; dragging = null; ghost = null;
     refillTray();
     saveBest();
@@ -527,7 +670,7 @@
     var hudTop = safeTopPx + 12;
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.font = '600 11px ' + FONT;
-    ctx.fillText('SCORE', boardX + 4, hudTop + 12);
+    ctx.fillText('PONTOS', boardX + 4, hudTop + 12);
     ctx.fillStyle = '#ffffff';
     ctx.font = '800 26px ' + FONT;
     ctx.fillText(String(score), boardX + 4, hudTop + 42);
@@ -535,7 +678,7 @@
     ctx.textAlign = 'right';
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.font = '600 11px ' + FONT;
-    ctx.fillText('BEST', boardX + boardSide - 4, hudTop + 12);
+    ctx.fillText('RECORDE', boardX + boardSide - 4, hudTop + 12);
     ctx.fillStyle = '#ffffff';
     ctx.font = '800 26px ' + FONT;
     ctx.fillText(String(best), boardX + boardSide - 4, hudTop + 42);
@@ -648,6 +791,8 @@
       ctx.restore();
     }
 
+    drawFx();
+
     // ---- game over ----
     if (gameOver) drawGameOver();
   }
@@ -670,11 +815,11 @@
     ctx.textBaseline = 'alphabetic';
     ctx.fillStyle = '#ffffff';
     ctx.font = '800 30px ' + FONT;
-    ctx.fillText('GAME OVER', W / 2, py + 56);
+    ctx.fillText('FIM DE JOGO', W / 2, py + 56);
 
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.font = '600 13px ' + FONT;
-    ctx.fillText('SCORE', W / 2, py + 94);
+    ctx.fillText('PONTOS', W / 2, py + 94);
 
     ctx.fillStyle = '#ffffff';
     ctx.font = '800 40px ' + FONT;
@@ -682,7 +827,7 @@
 
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.font = '600 15px ' + FONT;
-    ctx.fillText('Best ' + best, W / 2, py + 168);
+    ctx.fillText('Recorde ' + best, W / 2, py + 168);
 
     var bw = 200, bh = 52, bx = (W - bw) / 2, by = py + ph - 80;
     restartBtn = { x: bx, y: by, w: bw, h: bh };
@@ -692,7 +837,7 @@
     ctx.fillStyle = '#0d0f1c';
     ctx.font = '800 17px ' + FONT;
     ctx.textBaseline = 'middle';
-    ctx.fillText('PLAY AGAIN', W / 2, by + bh / 2 + 1);
+    ctx.fillText('JOGAR NOVAMENTE', W / 2, by + bh / 2 + 1);
     ctx.textBaseline = 'alphabetic';
     ctx.textAlign = 'left';
   }
@@ -773,14 +918,117 @@
   window.addEventListener('orientationchange', function () { setTimeout(layout, 250); });
   if (window.visualViewport) window.visualViewport.addEventListener('resize', layout);
 
+  // ---- perfect-clear VFX ----
+  function boardIsEmpty() {
+    for (var i = 0; i < board.length; i++) if (board[i] !== EMPTY) return false;
+    return true;
+  }
+  function triggerPerfectClear() {
+    perfectFx = { start: performance.now() };
+    var cx = boardX + boardSide / 2, cy = boardY + boardSide / 2;
+    for (var i = 0; i < 160; i++) {
+      var ang = Math.random() * Math.PI * 2;
+      var spd = 180 + Math.random() * 620;
+      particles.push({
+        x: cx + (Math.random() - 0.5) * boardSide * 0.3,
+        y: cy + (Math.random() - 0.5) * boardSide * 0.3,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd - 260,
+        size: 5 + Math.random() * 8,
+        rot: Math.random() * 6.28,
+        vr: (Math.random() - 0.5) * 12,
+        color: PALETTE[(Math.random() * PALETTE.length) | 0],
+        life: 1.3 + Math.random() * 1.0
+      });
+    }
+  }
+  function updateFx(dt) {
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.vy += 900 * dt;
+      p.vx *= (1 - 0.6 * dt);
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+      p.life -= dt;
+      if (p.life <= 0 || p.y > H + 40) particles.splice(i, 1);
+    }
+  }
+  function drawFx() {
+    var cx = boardX + boardSide / 2, cy = boardY + boardSide / 2, i;
+    if (perfectFx) {
+      var t = (now - perfectFx.start) / 1000;
+      if (t > 2.3) {
+        perfectFx = null;
+      } else {
+        // white flash over the board
+        if (t < 0.45) {
+          ctx.fillStyle = 'rgba(255,255,255,' + (0.55 * (1 - t / 0.45)).toFixed(3) + ')';
+          roundRect(boardX, boardY, boardSide, boardSide, cell * 0.24);
+          ctx.fill();
+        }
+        // expanding shockwave rings
+        for (i = 0; i < 3; i++) {
+          var rt = t - i * 0.14;
+          if (rt > 0 && rt < 0.9) {
+            var k = rt / 0.9;
+            ctx.save();
+            ctx.globalAlpha = 1 - k;
+            ctx.strokeStyle = PALETTE[(i * 2 + 2) % PALETTE.length];
+            ctx.lineWidth = 2 + 8 * (1 - k);
+            ctx.beginPath();
+            ctx.arc(cx, cy, k * boardSide * 0.85, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+      }
+    }
+    // confetti
+    for (i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, p.life / 0.5);
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size / 2, -p.size / 3, p.size, p.size * 0.66);
+      ctx.restore();
+    }
+    // title text
+    if (perfectFx) {
+      var tt = (now - perfectFx.start) / 1000;
+      var sc = tt < 0.25 ? 0.4 + (tt / 0.25) * 0.85 : (tt < 0.4 ? 1.25 - ((tt - 0.25) / 0.15) * 0.25 : 1);
+      var al = tt < 1.5 ? 1 : Math.max(0, 1 - (tt - 1.5) / 0.8);
+      ctx.save();
+      ctx.globalAlpha = al;
+      ctx.translate(cx, cy);
+      ctx.scale(sc, sc);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      var fs = Math.max(22, Math.min(boardSide * 0.12, 44));
+      ctx.font = '900 ' + fs + 'px ' + FONT;
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = fs * 0.28;
+      ctx.strokeStyle = '#0d0f1c';
+      ctx.strokeText('PERFEITO!', 0, 0);
+      ctx.fillStyle = '#fdd64a';
+      ctx.fillText('PERFEITO!', 0, 0);
+      ctx.restore();
+    }
+  }
+
   // ---- loop ----
   function frame() {
     now = performance.now();
     if (clearing && now >= clearing.removeAt) {
       for (var i = 0; i < clearing.cells.length; i++) board[clearing.cells[i]] = EMPTY;
       clearing = null;
+      if (boardIsEmpty()) triggerPerfectClear();
       finalizeTurn();
     }
+    updateFx(Math.min(0.05, Math.max(0, (now - (lastFrame || now)) / 1000)));
+    lastFrame = now;
     draw();
     requestAnimationFrame(frame);
   }
